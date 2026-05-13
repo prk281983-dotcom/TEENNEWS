@@ -1,11 +1,17 @@
 // ══════════════════════════════════════════════════════════════════
 //  BRIEF NEWS APP — BACKEND SERVER
 //  Node.js + Express  |  Railway-ready
+//  Real auth: SQLite + Resend email password reset
 // ══════════════════════════════════════════════════════════════════
 
 const express = require("express");
 const cors = require("cors");
 const Anthropic = require("@anthropic-ai/sdk");
+const Database = require("better-sqlite3");
+const bcrypt = require("bcryptjs");
+const crypto = require("crypto");
+const { Resend } = require("resend");
+const path = require("path");
 
 const app = express();
 app.use(cors());
@@ -13,8 +19,31 @@ app.use(express.json());
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const PEXELS_KEY = process.env.PEXELS_API_KEY;
+const NEWS_API_KEY = process.env.NEWS_API_KEY;
+const resend = new Resend(process.env.RESEND_API_KEY);
 
-// ─── In-memory stores ────────────────────────────────────────────
+// ─── SQLite Database Setup ────────────────────────────────────────
+const db = new Database(path.join("/tmp", "brief.db"));
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS reset_tokens (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT NOT NULL,
+    token TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    used INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+`);
+
+// ─── In-memory article stores ─────────────────────────────────────
 let feedArticles = [];
 let catchupArticles = [];
 let daily5Articles = [];
@@ -22,86 +51,342 @@ let usedImageIds = new Set();
 let lastFeedRefresh = 0;
 let lastDailyRefresh = 0;
 let lastCatchupRefresh = 0;
-
-// Track whether initial load is still in progress
 let initialLoadDone = false;
 let initialLoadError = null;
 
-// ─── Helpers ─────────────────────────────────────────────────────
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ─── Auth Routes ──────────────────────────────────────────────────
+
+// Sign Up
+app.post("/api/auth/signup", async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password)
+    return res.status(400).json({ error: "Email and password required." });
+  if (!email.includes("@"))
+    return res.status(400).json({ error: "Invalid email address." });
+  if (password.length < 8)
+    return res.status(400).json({ error: "Password must be at least 8 characters." });
+
+  try {
+    const existing = db.prepare("SELECT id FROM users WHERE email = ?").get(email);
+    if (existing)
+      return res.status(409).json({ error: "An account with this email already exists." });
+
+    const hash = await bcrypt.hash(password, 12);
+    db.prepare("INSERT INTO users (email, password_hash) VALUES (?, ?)").run(email, hash);
+    res.json({ success: true, message: "Account created successfully." });
+  } catch (e) {
+    console.error("[Signup] Error:", e.message);
+    res.status(500).json({ error: "Could not create account. Please try again." });
+  }
+});
+
+// Sign In
+app.post("/api/auth/signin", async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password)
+    return res.status(400).json({ error: "Email and password required." });
+
+  try {
+    const user = db.prepare("SELECT * FROM users WHERE email = ?").get(email);
+    if (!user)
+      return res.status(401).json({ error: "No account found with this email." });
+
+    const match = await bcrypt.compare(password, user.password_hash);
+    if (!match)
+      return res.status(401).json({ error: "Incorrect password." });
+
+    res.json({ success: true, email: user.email });
+  } catch (e) {
+    console.error("[Signin] Error:", e.message);
+    res.status(500).json({ error: "Sign in failed. Please try again." });
+  }
+});
+
+// Forgot Password — sends real email via Resend
+app.post("/api/auth/forgot-password", async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: "Email required." });
+
+  try {
+    const user = db.prepare("SELECT id FROM users WHERE email = ?").get(email);
+
+    // Always return success — don't reveal whether email exists
+    if (!user) {
+      return res.json({ success: true, message: "If an account exists, a reset email has been sent." });
+    }
+
+    const token = crypto.randomBytes(32).toString("hex");
+    const expiresAt = Date.now() + 60 * 60 * 1000; // 1 hour
+
+    db.prepare(
+      "INSERT INTO reset_tokens (email, token, expires_at) VALUES (?, ?, ?)"
+    ).run(email, token, expiresAt);
+
+    // Deep link opens the Expo app directly to reset screen
+    const resetLink = `briefnews://reset-password?token=${token}&email=${encodeURIComponent(email)}`;
+
+    await resend.emails.send({
+      from: "Brief <onboarding@resend.dev>",
+      to: email,
+      subject: "Reset your Brief password",
+      html: `
+        <!DOCTYPE html>
+        <html>
+        <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
+        <body style="margin:0;padding:0;background:#0d1117;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+          <table width="100%" cellpadding="0" cellspacing="0" style="background:#0d1117;padding:40px 20px;">
+            <tr><td align="center">
+              <table width="100%" style="max-width:480px;background:#1a1f2e;border-radius:20px;overflow:hidden;">
+
+                <tr>
+                  <td style="background:#D4622A;padding:32px;text-align:center;">
+                    <div style="font-size:52px;line-height:1;margin-bottom:10px;">B</div>
+                    <div style="font-size:26px;font-weight:900;color:#fff;">Brief</div>
+                    <div style="font-size:13px;color:rgba(255,255,255,0.75);margin-top:4px;">World news, made clear.</div>
+                  </td>
+                </tr>
+
+                <tr>
+                  <td style="padding:36px 32px;">
+                    <h2 style="margin:0 0 12px;font-size:22px;font-weight:800;color:#f1f5f9;">Reset your password</h2>
+                    <p style="margin:0 0 24px;font-size:15px;line-height:24px;color:#94a3b8;">
+                      We received a request to reset the password for <strong style="color:#f1f5f9;">${email}</strong>.
+                      Tap the button below to set a new password. This link expires in 1 hour.
+                    </p>
+
+                    <table width="100%" cellpadding="0" cellspacing="0">
+                      <tr>
+                        <td align="center" style="padding:8px 0 28px;">
+                          <a href="${resetLink}"
+                             style="display:inline-block;background:#D4622A;color:#fff;text-decoration:none;font-size:16px;font-weight:700;padding:16px 40px;border-radius:50px;">
+                            Reset Password
+                          </a>
+                        </td>
+                      </tr>
+                    </table>
+
+                    <div style="background:#232938;border-radius:12px;padding:16px;margin-bottom:24px;">
+                      <p style="margin:0 0 6px;font-size:11px;font-weight:700;color:#64748b;letter-spacing:1px;text-transform:uppercase;">Or copy this link</p>
+                      <p style="margin:0;font-size:12px;color:#94a3b8;word-break:break-all;line-height:18px;">${resetLink}</p>
+                    </div>
+
+                    <p style="margin:0;font-size:13px;color:#64748b;line-height:20px;">
+                      If you didn't request this, you can safely ignore this email — your account is still secure.
+                    </p>
+                  </td>
+                </tr>
+
+                <tr>
+                  <td style="padding:20px 32px;border-top:1px solid #2d3748;text-align:center;">
+                    <p style="margin:0;font-size:12px;color:#64748b;">© ${new Date().getFullYear()} Brief · World news, made clear</p>
+                  </td>
+                </tr>
+
+              </table>
+            </td></tr>
+          </table>
+        </body>
+        </html>
+      `,
+    });
+
+    res.json({ success: true, message: "If an account exists, a reset email has been sent." });
+  } catch (e) {
+    console.error("[ForgotPassword] Error:", e.message);
+    res.status(500).json({ error: "Could not send reset email. Please try again." });
+  }
+});
+
+// Verify reset token
+app.post("/api/auth/verify-reset-token", (req, res) => {
+  const { token, email } = req.body;
+  if (!token || !email)
+    return res.status(400).json({ error: "Token and email required." });
+
+  const record = db
+    .prepare("SELECT * FROM reset_tokens WHERE token = ? AND email = ? AND used = 0")
+    .get(token, email);
+
+  if (!record)
+    return res.status(400).json({ error: "Invalid or already used reset link." });
+  if (Date.now() > record.expires_at)
+    return res.status(400).json({ error: "This reset link has expired. Please request a new one." });
+
+  res.json({ success: true, valid: true });
+});
+
+// Reset Password
+app.post("/api/auth/reset-password", async (req, res) => {
+  const { token, email, newPassword } = req.body;
+  if (!token || !email || !newPassword)
+    return res.status(400).json({ error: "Token, email, and new password required." });
+  if (newPassword.length < 8)
+    return res.status(400).json({ error: "Password must be at least 8 characters." });
+
+  try {
+    const record = db
+      .prepare("SELECT * FROM reset_tokens WHERE token = ? AND email = ? AND used = 0")
+      .get(token, email);
+
+    if (!record)
+      return res.status(400).json({ error: "Invalid or already used reset link." });
+    if (Date.now() > record.expires_at)
+      return res.status(400).json({ error: "This reset link has expired. Please request a new one." });
+
+    const hash = await bcrypt.hash(newPassword, 12);
+    db.prepare("UPDATE users SET password_hash = ? WHERE email = ?").run(hash, email);
+    db.prepare("UPDATE reset_tokens SET used = 1 WHERE id = ?").run(record.id);
+
+    res.json({ success: true, message: "Password updated successfully." });
+  } catch (e) {
+    console.error("[ResetPassword] Error:", e.message);
+    res.status(500).json({ error: "Could not reset password. Please try again." });
+  }
+});
+
+// Change Email (signed in)
+app.post("/api/auth/change-email", async (req, res) => {
+  const { currentEmail, newEmail, password } = req.body;
+  if (!currentEmail || !newEmail || !password)
+    return res.status(400).json({ error: "All fields required." });
+
+  try {
+    const user = db.prepare("SELECT * FROM users WHERE email = ?").get(currentEmail);
+    if (!user) return res.status(404).json({ error: "Account not found." });
+
+    const match = await bcrypt.compare(password, user.password_hash);
+    if (!match) return res.status(401).json({ error: "Incorrect password." });
+
+    const existing = db.prepare("SELECT id FROM users WHERE email = ?").get(newEmail);
+    if (existing) return res.status(409).json({ error: "That email is already in use." });
+
+    db.prepare("UPDATE users SET email = ? WHERE email = ?").run(newEmail, currentEmail);
+    res.json({ success: true, email: newEmail });
+  } catch (e) {
+    res.status(500).json({ error: "Could not update email." });
+  }
+});
+
+// Change Password (signed in)
+app.post("/api/auth/change-password", async (req, res) => {
+  const { email, currentPassword, newPassword } = req.body;
+  if (!email || !currentPassword || !newPassword)
+    return res.status(400).json({ error: "All fields required." });
+  if (newPassword.length < 8)
+    return res.status(400).json({ error: "New password must be at least 8 characters." });
+
+  try {
+    const user = db.prepare("SELECT * FROM users WHERE email = ?").get(email);
+    if (!user) return res.status(404).json({ error: "Account not found." });
+
+    const match = await bcrypt.compare(currentPassword, user.password_hash);
+    if (!match) return res.status(401).json({ error: "Current password is incorrect." });
+
+    const hash = await bcrypt.hash(newPassword, 12);
+    db.prepare("UPDATE users SET password_hash = ? WHERE email = ?").run(hash, email);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: "Could not update password." });
+  }
+});
+
+// ─── NewsAPI ──────────────────────────────────────────────────────
+
+async function fetchRealHeadlines() {
+  const url = `https://newsapi.org/v2/top-headlines?language=en&pageSize=30&apiKey=${NEWS_API_KEY}`;
+  const res = await fetch(url);
+  const data = await res.json();
+  if (data.status !== "ok") throw new Error(`NewsAPI error: ${data.message}`);
+  return (data.articles || [])
+    .filter((a) => a.title && a.description && a.title !== "[Removed]")
+    .slice(0, 30);
+}
+
+async function fetchCatchupHeadlines() {
+  const threeMonthsAgo = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+  const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+  const queries = ["world politics government", "economy trade inflation", "climate environment", "technology AI", "conflict diplomacy"];
+  const q = queries[Math.floor(Math.random() * queries.length)];
+  const url = `https://newsapi.org/v2/everything?language=en&pageSize=30&sortBy=relevancy&from=${threeMonthsAgo}&to=${yesterday}&q=${encodeURIComponent(q)}&apiKey=${NEWS_API_KEY}`;
+  const res = await fetch(url);
+  const data = await res.json();
+  if (data.status !== "ok") throw new Error(`NewsAPI catchup error: ${data.message}`);
+  return (data.articles || []).filter((a) => a.title && a.description && a.title !== "[Removed]").slice(0, 30);
+}
+
+async function formatHeadlinesWithClaude(rawArticles, type = "feed") {
+  const today = new Date().toISOString().split("T")[0];
+  const headlinesList = rawArticles
+    .map((a, i) => `${i + 1}. [${a.source?.name || "News"}] ${a.title} — ${a.description || ""} (published: ${a.publishedAt || today})`)
+    .join("\n");
+  const typeInstructions = type === "catchup"
+    ? "These are stories from the past 1-3 months. Note they are recent but not today's news."
+    : "These are today's top headlines. Treat as breaking or very recent news.";
+
+  const response = await anthropic.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 12000,
+    messages: [{
+      role: "user",
+      content: `Format these REAL news headlines for Brief, a teen news app. ${typeInstructions}
+DO NOT invent events. Return ONLY a valid JSON array, no markdown.
+
+HEADLINES:
+${headlinesList}
+
+Each object EXACTLY:
+{
+  "id": "unique-string",
+  "title": "Teen-friendly headline max 80 chars",
+  "category": "World|Tech|Science|Climate|Economy|Culture|Sports|Health",
+  "summary": "2-sentence summary",
+  "region": "North America|Europe|Asia|Middle East|Africa|Latin America|Global",
+  "country": "main country",
+  "tag": "TOP 5 for 5 most important, FRESH for rest",
+  "em": "emoji",
+  "source": "source name",
+  "imageQuery": "4-5 word Pexels hero image search",
+  "bodyImageQuery": "4-5 word Pexels body image search, different angle",
+  "whatsGoingOn": ["4 factual bullets"],
+  "relevantDetails": ["4 context bullets"],
+  "quickExplain": ["4 teen-friendly bullets"],
+  "deeperAnalysis": ["4 analytical bullets"],
+  "pollQuestion": "two-option poll question",
+  "pollOptionA": "option A",
+  "pollOptionB": "option B",
+  "publishedAt": "real publishedAt date",
+  "readTime": 3
+}`
+    }],
+  });
+
+  const text = response.content[0].text.trim();
+  const fi = text.indexOf("["); const li = text.lastIndexOf("]");
+  if (fi === -1 || li === -1) throw new Error("No JSON array in Claude response");
+  return JSON.parse(text.slice(fi, li + 1));
+}
+
+// ─── Pexels ───────────────────────────────────────────────────────
 
 async function fetchPexelsImage(query, excludeIds = []) {
   if (!PEXELS_KEY) return null;
   try {
     const page = Math.floor(Math.random() * 5) + 1;
-    const url = `https://api.pexels.com/v1/search?query=${encodeURIComponent(
-      query
-    )}&per_page=15&page=${page}`;
-    const res = await fetch(url, {
-      headers: { Authorization: PEXELS_KEY },
-    });
+    const url = `https://api.pexels.com/v1/search?query=${encodeURIComponent(query)}&per_page=15&page=${page}&orientation=landscape`;
+    const res = await fetch(url, { headers: { Authorization: PEXELS_KEY } });
     const data = await res.json();
-    if (!data.photos || data.photos.length === 0) return null;
-    const available = data.photos.filter(
-      (p) => !usedImageIds.has(p.id) && !excludeIds.includes(p.id)
-    );
-    if (available.length === 0) return null;
+    if (!data.photos?.length) return null;
+    const available = data.photos.filter((p) => !usedImageIds.has(p.id) && !excludeIds.includes(p.id));
+    if (!available.length) return null;
     const photo = available[Math.floor(Math.random() * available.length)];
     usedImageIds.add(photo.id);
-    return {
-      id: photo.id,
-      url: photo.src.large2x || photo.src.large,
-      thumb: photo.src.medium,
-      photographer: photo.photographer,
-    };
+    return { id: photo.id, url: photo.src.large2x || photo.src.large, thumb: photo.src.medium };
   } catch (e) {
     console.error("Pexels error:", e.message);
     return null;
   }
-}
-
-async function generateArticlesFromClaude(prompt, count = 10) {
-  const today = new Date().toISOString().split("T")[0];
-  const systemPrompt = `You are a world-class news editor for BRIEF, a news app aimed at curious teens and young adults. 
-Today's date: ${today}
-
-Generate ${count} real, recent, newsworthy articles. Each article must:
-- Be about genuinely current events (within the last 24 hours ideally)
-- Cover diverse topics: geopolitics, science, tech, climate, economics, culture, sports, health
-- Be factually grounded (you may use events you know up to your training cutoff and extrapolate plausibly)
-- Have teen-friendly language in the Quick Explain section
-
-Respond ONLY with a valid JSON array. No markdown, no backticks, no preamble.
-
-Each article object must have EXACTLY these fields:
-{
-  "id": "unique-string-id",
-  "title": "Compelling headline (max 80 chars)",
-  "category": "one of: World | Tech | Science | Climate | Economy | Culture | Sports | Health",
-  "summary": "2-sentence summary",
-  "imageQuery": "specific Pexels search query for hero image (be very specific, e.g. 'United Nations assembly hall delegates')",
-  "bodyImageQuery": "different angle Pexels search query for body image (e.g. 'diplomats handshake agreement')",
-  "whatsGoingOn": ["bullet 1", "bullet 2", "bullet 3", "bullet 4"],
-  "relevantDetails": ["bullet 1", "bullet 2", "bullet 3", "bullet 4"],
-  "quickExplain": ["teen-friendly bullet 1", "teen-friendly bullet 2", "teen-friendly bullet 3", "teen-friendly bullet 4"],
-  "deeperAnalysis": ["analytical bullet 1", "analytical bullet 2", "analytical bullet 3", "analytical bullet 4"],
-  "pollQuestion": "A yes/no or two-option poll question about this article",
-  "pollOptionA": "Option A label",
-  "pollOptionB": "Option B label",
-  "publishedAt": "${today}T${String(Math.floor(Math.random() * 23)).padStart(2, "0")}:00:00Z",
-  "readTime": 3
-}`;
-
-  const response = await anthropic.messages.create({
-    model: "claude-opus-4-5",
-    max_tokens: 8000,
-    system: systemPrompt,
-    messages: [{ role: "user", content: prompt }],
-  });
-
-  const text = response.content[0].text.trim();
-  const clean = text.replace(/^```json\s*/i, "").replace(/```\s*$/i, "").trim();
-  return JSON.parse(clean);
 }
 
 async function attachImages(articles) {
@@ -110,127 +395,104 @@ async function attachImages(articles) {
     const usedThisArticle = [];
     const hero = await fetchPexelsImage(article.imageQuery, usedThisArticle);
     if (hero) usedThisArticle.push(hero.id);
-    const body = await fetchPexelsImage(
-      article.bodyImageQuery || article.imageQuery + " close up",
-      usedThisArticle
-    );
-    result.push({
-      ...article,
-      heroImage: hero ? hero.url : null,
-      heroThumb: hero ? hero.thumb : null,
-      bodyImage: body ? body.url : null,
-      bodyThumb: body ? body.thumb : null,
-    });
+    const body = await fetchPexelsImage(article.bodyImageQuery || article.imageQuery + " detail", usedThisArticle);
+    result.push({ ...article, heroImage: hero?.url || null, heroThumb: hero?.thumb || null, bodyImage: body?.url || null, bodyThumb: body?.thumb || null });
     await sleep(120);
   }
   return result;
 }
 
-// ─── Article generation jobs ──────────────────────────────────────
+// ─── Article refresh jobs ─────────────────────────────────────────
 
 async function refreshFeed() {
-  console.log("[Feed] Generating 30 fresh articles...");
+  console.log("[Feed] Fetching real headlines...");
   try {
-    const batch1 = await generateArticlesFromClaude(
-      "Generate 10 of the most significant breaking news stories from today across diverse global topics.",
-      10
-    );
-    const batch2 = await generateArticlesFromClaude(
-      "Generate 10 more current news stories from today — focus on tech, science, climate, and economics.",
-      10
-    );
-    const batch3 = await generateArticlesFromClaude(
-      "Generate 10 more today's news stories — focus on culture, sports, health, and human interest.",
-      10
-    );
-
-    const all = [...batch1, ...batch2, ...batch3].map((a, i) => ({
-      ...a,
-      id: `feed-${Date.now()}-${i}`,
-    }));
-
-    const withImages = await attachImages(all);
-    feedArticles = withImages;
+    let rawArticles = NEWS_API_KEY ? await fetchRealHeadlines() : [];
+    if (!rawArticles.length) { await refreshFeedFallback(); return; }
+    const formatted = await formatHeadlinesWithClaude(rawArticles, "feed");
+    feedArticles = await attachImages(formatted.map((a, i) => ({ ...a, id: `feed-${Date.now()}-${i}` })));
     lastFeedRefresh = Date.now();
-    console.log(`[Feed] Done — ${feedArticles.length} articles ready.`);
-  } catch (e) {
-    console.error("[Feed] Error:", e.message);
-  }
+    console.log(`[Feed] Done — ${feedArticles.length} articles.`);
+  } catch (e) { console.error("[Feed] Error:", e.message); await refreshFeedFallback(); }
+}
+
+async function refreshFeedFallback() {
+  console.log("[Feed Fallback] Generating with Claude...");
+  try {
+    const today = new Date().toISOString().split("T")[0];
+    const response = await anthropic.messages.create({
+      model: "claude-opus-4-5", max_tokens: 12000,
+      messages: [{ role: "user", content: `Generate 30 current world news articles for today ${today} for a teen news app. Tag 5 as "TOP 5", rest "FRESH". Return ONLY a valid JSON array. Each: id, title, category, summary, region, country, tag, em, source, imageQuery, bodyImageQuery, whatsGoingOn (4), relevantDetails (4), quickExplain (4), deeperAnalysis (4), pollQuestion, pollOptionA, pollOptionB, publishedAt, readTime.` }],
+    });
+    const text = response.content[0].text.trim();
+    const fi = text.indexOf("["); const li = text.lastIndexOf("]");
+    if (fi === -1 || li === -1) throw new Error("No array");
+    const parsed = JSON.parse(text.slice(fi, li + 1));
+    feedArticles = await attachImages(parsed.map((a, i) => ({ ...a, id: `feed-${Date.now()}-${i}` })));
+    lastFeedRefresh = Date.now();
+    console.log(`[Feed Fallback] Done — ${feedArticles.length} articles.`);
+  } catch (e) { console.error("[Feed Fallback] Error:", e.message); }
 }
 
 async function refreshDaily5() {
-  console.log("[Daily5] Generating 5 best stories...");
+  console.log("[Daily5] Building top 5...");
   try {
-    const articles = await generateArticlesFromClaude(
-      `Generate exactly 5 articles that represent the 5 MOST SIGNIFICANT news stories of today ${
-        new Date().toISOString().split("T")[0]
-      }. These should be the stories every informed person should know about today. Prioritize global impact, novelty, and importance.`,
-      5
-    );
-    const withImages = await attachImages(
-      articles.map((a, i) => ({
-        ...a,
-        id: `daily5-${Date.now()}-${i}`,
-      }))
-    );
-    daily5Articles = withImages;
+    const top5 = feedArticles.filter((a) => a.tag === "TOP 5").slice(0, 5);
+    if (top5.length >= 5) { daily5Articles = top5; lastDailyRefresh = Date.now(); console.log("[Daily5] Done from feed."); return; }
+    const today = new Date().toISOString().split("T")[0];
+    const response = await anthropic.messages.create({
+      model: "claude-opus-4-5", max_tokens: 5000,
+      messages: [{ role: "user", content: `Generate the 5 most significant world news stories of today ${today} for a teen news app. Return ONLY a JSON array of 5 objects: id, title, category, summary, region, country, tag ("TOP 5"), em, source, imageQuery, bodyImageQuery, whatsGoingOn (4), relevantDetails (4), quickExplain (4), deeperAnalysis (4), pollQuestion, pollOptionA, pollOptionB, publishedAt, readTime.` }],
+    });
+    const text = response.content[0].text.trim();
+    const fi = text.indexOf("["); const li = text.lastIndexOf("]");
+    if (fi === -1 || li === -1) throw new Error("No array");
+    const parsed = JSON.parse(text.slice(fi, li + 1));
+    daily5Articles = await attachImages(parsed.map((a, i) => ({ ...a, id: `daily5-${Date.now()}-${i}`, tag: "TOP 5" })));
     lastDailyRefresh = Date.now();
     console.log("[Daily5] Done.");
-  } catch (e) {
-    console.error("[Daily5] Error:", e.message);
-  }
+  } catch (e) { console.error("[Daily5] Error:", e.message); }
 }
 
 async function refreshCatchup() {
-  console.log("[Catchup] Generating 30 recent-history articles...");
+  console.log("[Catchup] Fetching historical headlines...");
   try {
-    const batch1 = await generateArticlesFromClaude(
-      "Generate 10 important news stories from the past 1-4 weeks that are still highly relevant today. Mix topics.",
-      10
-    );
-    const batch2 = await generateArticlesFromClaude(
-      "Generate 10 significant news stories from the past 1-3 months — stories that had lasting impact.",
-      10
-    );
-    const batch3 = await generateArticlesFromClaude(
-      "Generate 10 notable news stories from the past 2-3 months covering science breakthroughs, climate milestones, tech launches, or geopolitical developments.",
-      10
-    );
-
-    const newArticles = [...batch1, ...batch2, ...batch3].map((a, i) => ({
-      ...a,
-      id: `catchup-${Date.now()}-${i}`,
-    }));
+    let rawArticles = NEWS_API_KEY ? await fetchCatchupHeadlines() : [];
+    let newArticles = [];
+    if (rawArticles.length > 0) {
+      const formatted = await formatHeadlinesWithClaude(rawArticles, "catchup");
+      newArticles = formatted.map((a, i) => ({ ...a, id: `catchup-${Date.now()}-${i}` }));
+    } else {
+      const response = await anthropic.messages.create({
+        model: "claude-opus-4-5", max_tokens: 8000,
+        messages: [{ role: "user", content: `Generate 20 important news stories from the past 1-3 months still relevant today. Return ONLY a valid JSON array. Each: id, title, category, summary, region, country, tag ("FRESH"), em, source, imageQuery, bodyImageQuery, whatsGoingOn (4), relevantDetails (4), quickExplain (4), deeperAnalysis (4), pollQuestion, pollOptionA, pollOptionB, publishedAt (ISO 1-90 days ago), readTime.` }],
+      });
+      const text = response.content[0].text.trim();
+      const fi = text.indexOf("["); const li = text.lastIndexOf("]");
+      if (fi !== -1 && li !== -1) {
+        const parsed = JSON.parse(text.slice(fi, li + 1));
+        newArticles = parsed.map((a, i) => ({ ...a, id: `catchup-${Date.now()}-${i}` }));
+      }
+    }
     const withImages = await attachImages(newArticles);
-
     const ninetyDaysAgo = Date.now() - 90 * 24 * 60 * 60 * 1000;
-    catchupArticles = [
-      ...catchupArticles.filter(
-        (a) => new Date(a.publishedAt).getTime() > ninetyDaysAgo
-      ),
-      ...withImages,
-    ];
+    catchupArticles = [...catchupArticles.filter((a) => new Date(a.publishedAt).getTime() > ninetyDaysAgo), ...withImages];
     lastCatchupRefresh = Date.now();
-    console.log(`[Catchup] Pool now has ${catchupArticles.length} articles.`);
-  } catch (e) {
-    console.error("[Catchup] Error:", e.message);
-  }
+    console.log(`[Catchup] Pool: ${catchupArticles.length} articles.`);
+  } catch (e) { console.error("[Catchup] Error:", e.message); }
 }
 
 // ─── Scheduling ───────────────────────────────────────────────────
 const HOUR = 60 * 60 * 1000;
 const DAY = 24 * HOUR;
 
-// FIX: Run scheduler in background — does NOT block server startup.
-// Railway's healthcheck hits /health almost immediately; the old code
-// would block the event loop during the long AI generation and fail.
 function startScheduler() {
   (async () => {
     try {
       await refreshFeed();
-      await sleep(5000);
+      await sleep(3000);
       await refreshDaily5();
-      await sleep(5000);
+      await sleep(3000);
       await refreshCatchup();
     } catch (e) {
       initialLoadError = e.message;
@@ -238,111 +500,60 @@ function startScheduler() {
     } finally {
       initialLoadDone = true;
     }
-
-    setInterval(async () => {
-      await refreshFeed();
-    }, HOUR);
-
-    setInterval(async () => {
-      await refreshDaily5();
-      await sleep(10000);
-      await refreshCatchup();
-    }, DAY);
+    setInterval(async () => { usedImageIds = new Set(); await refreshFeed(); }, HOUR);
+    setInterval(async () => { await refreshDaily5(); await sleep(10000); await refreshCatchup(); }, DAY);
   })();
 }
 
-// ─── Routes ───────────────────────────────────────────────────────
+// ─── Article Routes ───────────────────────────────────────────────
 
-// FIX: /health now responds immediately even while articles are loading.
-// Returns 503 only if something fatally crashed, not just "still loading".
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
-    initialLoadDone,
-    initialLoadError,
+    newsApiConnected: !!NEWS_API_KEY,
+    resendConnected: !!process.env.RESEND_API_KEY,
+    initialLoadDone, initialLoadError,
     feedCount: feedArticles.length,
     daily5Count: daily5Articles.length,
     catchupCount: catchupArticles.length,
-    lastFeedRefresh: lastFeedRefresh
-      ? new Date(lastFeedRefresh).toISOString()
-      : null,
-    lastDailyRefresh: lastDailyRefresh
-      ? new Date(lastDailyRefresh).toISOString()
-      : null,
+    lastFeedRefresh: lastFeedRefresh ? new Date(lastFeedRefresh).toISOString() : null,
     usedImages: usedImageIds.size,
   });
 });
 
 app.get("/api/articles/feed", (req, res) => {
-  res.json({
-    articles: feedArticles,
-    lastRefresh: lastFeedRefresh,
-    nextRefresh: lastFeedRefresh + HOUR,
-    loading: feedArticles.length === 0 && !initialLoadDone,
-  });
+  res.json({ articles: feedArticles, lastRefresh: lastFeedRefresh, nextRefresh: lastFeedRefresh + HOUR, loading: feedArticles.length === 0 && !initialLoadDone });
 });
 
 app.get("/api/articles/daily5", (req, res) => {
-  res.json({
-    articles: daily5Articles,
-    lastRefresh: lastDailyRefresh,
-    nextRefresh: lastDailyRefresh + DAY,
-    loading: daily5Articles.length === 0 && !initialLoadDone,
-  });
+  res.json({ articles: daily5Articles, lastRefresh: lastDailyRefresh, nextRefresh: lastDailyRefresh + DAY, loading: daily5Articles.length === 0 && !initialLoadDone });
 });
 
 app.get("/api/articles/catchup", (req, res) => {
   const { category, page = 1, limit = 20 } = req.query;
-  let articles = [...catchupArticles].sort(
-    (a, b) => new Date(b.publishedAt) - new Date(a.publishedAt)
-  );
-  if (category && category !== "All") {
-    articles = articles.filter((a) => a.category === category);
-  }
+  let articles = [...catchupArticles].sort((a, b) => new Date(b.publishedAt) - new Date(a.publishedAt));
+  if (category && category !== "All") articles = articles.filter((a) => a.category === category);
   const start = (Number(page) - 1) * Number(limit);
-  const paginated = articles.slice(start, start + Number(limit));
-  res.json({
-    articles: paginated,
-    total: articles.length,
-    page: Number(page),
-    lastRefresh: lastCatchupRefresh,
-    loading: catchupArticles.length === 0 && !initialLoadDone,
-  });
+  res.json({ articles: articles.slice(start, start + Number(limit)), total: articles.length, page: Number(page), lastRefresh: lastCatchupRefresh, loading: catchupArticles.length === 0 && !initialLoadDone });
 });
 
-// Ask AI about an article
 app.post("/api/ask", async (req, res) => {
   const { question, articleTitle, articleSummary } = req.body;
   if (!question) return res.status(400).json({ error: "question required" });
-
   try {
     const response = await anthropic.messages.create({
-      model: "claude-haiku-4-5",
-      max_tokens: 400,
-      messages: [
-        {
-          role: "user",
-          content: `You are answering a question about a news article for a teen/young adult reader. Be clear, concise, and helpful. Max 3 short paragraphs.
-
-Article: "${articleTitle}"
-Summary: "${articleSummary}"
-
-Question: ${question}`,
-        },
-      ],
+      model: "claude-haiku-4-5", max_tokens: 400,
+      messages: [{ role: "user", content: `Answer this question about a news article for a teen reader. Max 3 short paragraphs.\n\nArticle: "${articleTitle}"\nSummary: "${articleSummary}"\n\nQuestion: ${question}` }],
     });
     res.json({ answer: response.content[0].text });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ─── Start ────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
-
-// FIX: Start listening FIRST, then kick off background scheduler.
-// This ensures Railway's healthcheck never times out waiting for AI calls.
 app.listen(PORT, () => {
   console.log(`Brief backend running on port ${PORT}`);
-  startScheduler(); // non-blocking — runs in background
+  if (!NEWS_API_KEY) console.warn("⚠️  NEWS_API_KEY not set");
+  if (!process.env.RESEND_API_KEY) console.warn("⚠️  RESEND_API_KEY not set");
+  startScheduler();
 });
