@@ -625,6 +625,14 @@ function startScheduler() {
       await sleep(10000);
       await refreshCatchup();
     }, DAY);
+
+    // Keep-alive ping every 10 minutes to prevent Render free tier sleep
+    setInterval(async () => {
+      try {
+        await fetch(`https://teennews-2.onrender.com/health`);
+        console.log('[KeepAlive] Pinged');
+      } catch (e) {}
+    }, 10 * 60 * 1000);
   })();
 }
 
