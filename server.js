@@ -61,7 +61,6 @@ async function fetchGNews(type) {
   const now = Date.now();
   const today = new Date().toISOString().split('T')[0];
 
-  // Return cache if still fresh
   if (type === 'feed' && cache.feed.articles.length > 0 && now - cache.feed.fetchedAt < FEED_TTL) {
     console.log(`[feed] Serving from cache`);
     return cache.feed.articles;
@@ -71,7 +70,7 @@ async function fetchGNews(type) {
     return cache.catchup.articles;
   }
   if (type === 'daily5' && cache.daily5.articles.length > 0 && cache.daily5.day === today) {
-    console.log(`[daily5] Serving from cache (today's stories)`);
+    console.log(`[daily5] Serving from cache`);
     return cache.daily5.articles;
   }
 
@@ -81,59 +80,90 @@ async function fetchGNews(type) {
   const allArticles = [];
 
   if (type === 'feed') {
-    // 6 topics × 5 articles = up to 30 fresh articles
-    const topics = ["world", "nation", "technology", "science", "health", "entertainment"];
-    for (const topic of topics) {
+    // Cover every category the app shows — one query per category
+    const queries = [
+      { q: null, topic: 'world' },
+      { q: null, topic: 'nation' },
+      { q: null, topic: 'technology' },
+      { q: null, topic: 'science' },
+      { q: null, topic: 'health' },
+      { q: null, topic: 'sports' },
+      { q: null, topic: 'entertainment' },
+      { q: 'climate change environment 2025', topic: null },
+      { q: 'economy finance markets 2025', topic: null },
+    ];
+    for (const { q, topic } of queries) {
       try {
-        const url = `https://gnews.io/api/v4/top-headlines?lang=en&max=5&topic=${topic}&apikey=${GNEWS_KEY}`;
+        const url = topic
+          ? `https://gnews.io/api/v4/top-headlines?lang=en&max=5&topic=${topic}&apikey=${GNEWS_KEY}`
+          : `https://gnews.io/api/v4/search?q=${encodeURIComponent(q)}&lang=en&max=5&sortby=publishedAt&apikey=${GNEWS_KEY}`;
         const res = await fetch(url);
         const data = await res.json();
         if (data.articles) allArticles.push(...data.articles);
-        await delay(300);
+        await delay(250);
       } catch (e) {
-        console.error(`[GNews feed/${topic}]`, e.message);
+        console.error(`[GNews feed]`, e.message);
       }
     }
   } else if (type === 'catchup') {
-    // 6 queries × 5 articles = up to 30 articles from last 3 months
+    // One query per app category, from last 3 months
     const threeMonthsAgo = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
     const queries = [
-      "world politics", "economy finance", "climate environment",
-      "technology artificial intelligence", "conflict war", "science discovery"
+      'world politics international',
+      'economy trade finance',
+      'climate environment nature',
+      'technology artificial intelligence',
+      'science discovery research',
+      'health medicine pandemic',
+      'sports championship tournament',
+      'culture arts entertainment',
+      'conflict war geopolitics',
     ];
     for (const q of queries) {
       try {
-        const url = `https://gnews.io/api/v4/search?q=${encodeURIComponent(q)}&lang=en&max=5&from=${threeMonthsAgo}T00:00:00Z&sortby=relevance&apikey=${GNEWS_KEY}`;
+        const url = `https://gnews.io/api/v4/search?q=${encodeURIComponent(q)}&lang=en&max=4&from=${threeMonthsAgo}T00:00:00Z&sortby=relevance&apikey=${GNEWS_KEY}`;
         const res = await fetch(url);
         const data = await res.json();
         if (data.articles) allArticles.push(...data.articles);
-        await delay(300);
+        await delay(250);
       } catch (e) {
-        console.error(`[GNews catchup/${q}]`, e.message);
+        console.error(`[GNews catchup]`, e.message);
       }
     }
   } else if (type === 'daily5') {
-    // Top 5 most important stories of the day
-    try {
-      const url = `https://gnews.io/api/v4/top-headlines?lang=en&max=5&topic=breaking-news&apikey=${GNEWS_KEY}`;
-      const res = await fetch(url);
-      const data = await res.json();
-      if (data.articles) allArticles.push(...data.articles);
-    } catch (e) {
-      // Fallback to world headlines
+    // Top 5 most important breaking stories today
+    const todayQueries = ['breaking news today', 'top story today'];
+    for (const q of todayQueries) {
+      try {
+        const url = `https://gnews.io/api/v4/search?q=${encodeURIComponent(q)}&lang=en&max=5&sortby=publishedAt&apikey=${GNEWS_KEY}`;
+        const res = await fetch(url);
+        const data = await res.json();
+        if (data.articles) allArticles.push(...data.articles);
+        await delay(250);
+      } catch (e) {
+        console.error(`[GNews daily5]`, e.message);
+      }
+    }
+    // Fallback to world top headlines
+    if (allArticles.length < 3) {
       try {
         const url = `https://gnews.io/api/v4/top-headlines?lang=en&max=5&topic=world&apikey=${GNEWS_KEY}`;
         const res = await fetch(url);
         const data = await res.json();
         if (data.articles) allArticles.push(...data.articles);
-      } catch (e2) {
-        console.error(`[GNews daily5]`, e2.message);
-      }
+      } catch (e) {}
     }
   }
 
+  // Deduplicate by title
+  const seen = new Set();
   const filtered = allArticles
-    .filter(a => a.title && a.description && a.title !== "[Removed]" && a.url)
+    .filter(a => {
+      if (!a.title || !a.description || a.title === '[Removed]' || !a.url) return false;
+      if (seen.has(a.title)) return false;
+      seen.add(a.title);
+      return true;
+    })
     .map((a, i) => ({
       id: `${type}-${i}-${Date.now()}`,
       title: a.title,
@@ -142,10 +172,9 @@ async function fetchGNews(type) {
       url: a.url,
       image: a.image || null,
       publishedAt: a.publishedAt,
-      source: { name: a.source?.name || "News" },
+      source: { name: a.source?.name || 'News' },
     }));
 
-  // Update cache
   cache[type].articles = filtered;
   cache[type].fetchedAt = now;
   if (type === 'daily5') cache.daily5.day = today;
