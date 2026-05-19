@@ -56,7 +56,7 @@ const FEED_TTL    = 60 * 60 * 1000;       // 1 hour
 const CATCHUP_TTL = 60 * 60 * 1000;       // 1 hour
 const DAILY5_TTL  = 24 * 60 * 60 * 1000; // 24 hours
 
-// ── GNews fetcher ─────────────────────────────────────────────────
+// ── NewsAPI fetcher ───────────────────────────────────────────────
 async function fetchGNews(type) {
   const now = Date.now();
   const today = new Date().toISOString().split('T')[0];
@@ -76,86 +76,70 @@ async function fetchGNews(type) {
 
   if (!GNEWS_KEY) throw new Error("NEWS_API_KEY not set");
 
-  console.log(`[${type}] Fetching fresh headlines from GNews...`);
+  console.log(`[${type}] Fetching fresh headlines from NewsAPI...`);
   const allArticles = [];
+  const BASE = 'https://newsapi.org/v2';
 
   if (type === 'feed') {
-    // Cover every category the app shows — one query per category
-    const queries = [
-      { q: null, topic: 'world' },
-      { q: null, topic: 'nation' },
-      { q: null, topic: 'technology' },
-      { q: null, topic: 'science' },
-      { q: null, topic: 'health' },
-      { q: null, topic: 'sports' },
-      { q: null, topic: 'entertainment' },
-      { q: 'climate change environment 2025', topic: null },
-      { q: 'economy finance markets 2025', topic: null },
-    ];
-    for (const { q, topic } of queries) {
+    // Top headlines per category — very recent
+    const categories = ['general', 'technology', 'science', 'health', 'sports', 'entertainment', 'business'];
+    for (const cat of categories) {
       try {
-        const url = topic
-          ? `https://gnews.io/api/v4/top-headlines?lang=en&max=5&topic=${topic}&apikey=${GNEWS_KEY}`
-          : `https://gnews.io/api/v4/search?q=${encodeURIComponent(q)}&lang=en&max=5&sortby=publishedAt&apikey=${GNEWS_KEY}`;
+        const url = `${BASE}/top-headlines?language=en&category=${cat}&pageSize=5&apiKey=${GNEWS_KEY}`;
         const res = await fetch(url);
         const data = await res.json();
-        if (data.articles) allArticles.push(...data.articles);
-        await delay(250);
+        if (data.articles) allArticles.push(...data.articles.map(a => ({ ...a, _cat: cat })));
+        await delay(200);
       } catch (e) {
-        console.error(`[GNews feed]`, e.message);
+        console.error(`[NewsAPI feed/${cat}]`, e.message);
       }
     }
+    // Also pull climate/environment via everything endpoint
+    try {
+      const url = `${BASE}/everything?q=climate+OR+environment&language=en&sortBy=publishedAt&pageSize=5&apiKey=${GNEWS_KEY}`;
+      const res = await fetch(url);
+      const data = await res.json();
+      if (data.articles) allArticles.push(...data.articles.map(a => ({ ...a, _cat: 'climate' })));
+    } catch (e) {}
+
   } else if (type === 'catchup') {
-    // One query per app category, from last 3 months
+    // Everything endpoint per topic, last 3 months
     const threeMonthsAgo = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-    const queries = [
-      'world politics international',
-      'economy trade finance',
-      'climate environment nature',
-      'technology artificial intelligence',
-      'science discovery research',
-      'health medicine pandemic',
-      'sports championship tournament',
-      'culture arts entertainment',
-      'conflict war geopolitics',
+    const topics = [
+      { q: 'world politics international', cat: 'world' },
+      { q: 'economy finance trade', cat: 'economy' },
+      { q: 'climate environment', cat: 'climate' },
+      { q: 'technology AI artificial intelligence', cat: 'tech' },
+      { q: 'science discovery', cat: 'science' },
+      { q: 'health medicine', cat: 'health' },
+      { q: 'sports championship', cat: 'sports' },
+      { q: 'culture entertainment', cat: 'culture' },
     ];
-    for (const q of queries) {
+    for (const { q, cat } of topics) {
       try {
-        const url = `https://gnews.io/api/v4/search?q=${encodeURIComponent(q)}&lang=en&max=4&from=${threeMonthsAgo}T00:00:00Z&sortby=relevance&apikey=${GNEWS_KEY}`;
+        const url = `${BASE}/everything?q=${encodeURIComponent(q)}&language=en&from=${threeMonthsAgo}&sortBy=relevance&pageSize=5&apiKey=${GNEWS_KEY}`;
         const res = await fetch(url);
         const data = await res.json();
-        if (data.articles) allArticles.push(...data.articles);
-        await delay(250);
+        if (data.articles) allArticles.push(...data.articles.map(a => ({ ...a, _cat: cat })));
+        await delay(200);
       } catch (e) {
-        console.error(`[GNews catchup]`, e.message);
+        console.error(`[NewsAPI catchup/${cat}]`, e.message);
       }
     }
+
   } else if (type === 'daily5') {
-    // Top 5 most important breaking stories today
-    const todayQueries = ['breaking news today', 'top story today'];
-    for (const q of todayQueries) {
-      try {
-        const url = `https://gnews.io/api/v4/search?q=${encodeURIComponent(q)}&lang=en&max=5&sortby=publishedAt&apikey=${GNEWS_KEY}`;
-        const res = await fetch(url);
-        const data = await res.json();
-        if (data.articles) allArticles.push(...data.articles);
-        await delay(250);
-      } catch (e) {
-        console.error(`[GNews daily5]`, e.message);
-      }
-    }
-    // Fallback to world top headlines
-    if (allArticles.length < 3) {
-      try {
-        const url = `https://gnews.io/api/v4/top-headlines?lang=en&max=5&topic=world&apikey=${GNEWS_KEY}`;
-        const res = await fetch(url);
-        const data = await res.json();
-        if (data.articles) allArticles.push(...data.articles);
-      } catch (e) {}
+    // Top 5 breaking stories right now
+    try {
+      const url = `${BASE}/top-headlines?language=en&category=general&pageSize=10&apiKey=${GNEWS_KEY}`;
+      const res = await fetch(url);
+      const data = await res.json();
+      if (data.articles) allArticles.push(...data.articles);
+    } catch (e) {
+      console.error(`[NewsAPI daily5]`, e.message);
     }
   }
 
-  // Deduplicate by title
+  // Deduplicate and normalize
   const seen = new Set();
   const filtered = allArticles
     .filter(a => {
@@ -170,9 +154,10 @@ async function fetchGNews(type) {
       description: a.description,
       content: a.content || a.description,
       url: a.url,
-      image: a.image || null,
+      image: a.urlToImage || null,
       publishedAt: a.publishedAt,
       source: { name: a.source?.name || 'News' },
+      _cat: a._cat || 'general',
     }));
 
   cache[type].articles = filtered;
