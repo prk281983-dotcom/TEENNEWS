@@ -444,7 +444,7 @@ app.get("/", (req, res) => res.json({ name: "Brief News API v4", status: "runnin
 // Keep-alive ping every 10 minutes
 setInterval(async () => {
   try {
-    await fetch(`https://teennews-5.onrender.com/api/health`);
+    await fetch(`https://teennews-8.onrender.com/api/health`);
     console.log("[KeepAlive] Pinged");
   } catch (_) {}
 }, 10 * 60 * 1000);
